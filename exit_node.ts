@@ -1,3 +1,41 @@
+// mhrv-rs exit node — deploy as an HTTP endpoint on any serverless
+// TypeScript host with a public IP that isn't a Google datacenter
+// (Deno Deploy, fly.io, your own VPS, etc.). Uses only web-standard
+// `Request` / `Response` / `fetch` so it's portable across runtimes.
+//
+// Purpose: chain client → Apps Script → this exit node → destination.
+// Apps Script's UrlFetchApp can't reach Cloudflare-protected sites that
+// flag Google datacenter IPs as bots (chatgpt.com, claude.ai, grok.com,
+// many other CF-fronted SaaS). This exit node sits between Apps Script
+// and the destination; the destination sees the exit node's outbound IP
+// (generally not flagged as Google datacenter) and accepts the request.
+//
+// Setup:
+//   1. Pick a host that runs web-standard fetch handlers (e.g. Deno
+//      Deploy, fly.io with a thin server wrapper, or any cheap VPS
+//      running Deno / Node + this script as a handler).
+//   2. Paste the contents of this file as the request handler.
+//   3. Set PSK below to a strong secret (`openssl rand -hex 32` from
+//      a terminal — DO NOT leave the placeholder in production).
+//   4. Deploy and copy the public URL of the deployed handler.
+//   5. In mhrv-rs config.toml, add:
+//      [exit_node];
+//      enabled = true;
+//      relay_url = "https://your-deployed-exit-node.example.com";
+//      psk = "<the same PSK you set in step 1>";
+//      mode = "selective";
+//      hosts = ["chatgpt.com", "claude.ai", "x.com", "grok.com", "openai.com"];
+//
+// Threat model: PSK is the only thing keeping this from being an open
+// proxy on the public internet. Treat it like a password: do not commit
+// to source control, do not share publicly, rotate if leaked. The exit
+// node refuses all requests that don't carry the matching PSK.
+//
+// Failure mode: if the exit node is unreachable, mhrv-rs falls back to
+// the regular Apps Script relay automatically — the only consequence
+// of an offline exit node is that ChatGPT/Claude/Grok stop working;
+// other sites are unaffected.
+
 const PSK = "Fara12233221hara";
 
 // Headers the client may send that must NOT be forwarded to the
@@ -106,3 +144,35 @@ export async function handleExitNodeRequest(req: Request): Promise<Response> {
       body: payload,
       redirect: "manual",
     });
+
+    // `fetch()` (Deno / Bun / Node) auto-decompresses gzip / br / deflate
+    // responses, so `resp.arrayBuffer()` returns plain bytes — but the
+    // destination's `Content-Encoding` header is still on `resp.headers`.
+    // Forwarding it would tell the client browser "this body is gzipped"
+    // when it isn't, producing `Content Encoding Error` (#964). Same goes
+    // for `Content-Length` — the post-decompression byte count is
+    // different from what the destination announced. Strip both. The
+    // Apps Script + Rust transport layer below us re-frames the wire body
+    // anyway, so neither header is meaningful to forward.
+    const data = new Uint8Array(await resp.arrayBuffer());
+    const respHeaders: Record<string, string> = {};
+    resp.headers.forEach((value, key) => {
+      const lower = key.toLowerCase();
+      if (lower === "content-encoding" || lower === "content-length") return;
+      respHeaders[key] = value;
+    });
+
+    return Response.json({
+      s: resp.status,
+      h: respHeaders,
+      b: encodeBytesToBase64(data),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return Response.json({ e: message }, { status: 500 });
+  }
+}
+
+export default {
+  fetch: handleExitNodeRequest,
+};
