@@ -1,4 +1,4 @@
- ```typescript
+ typescript
    const PSK = "Fara12233221hara";
 
    const STRIP_HEADERS = new Set([
@@ -98,4 +98,4 @@
    export default {
      fetch: handleExitNodeRequest,
    };
- ```
+
